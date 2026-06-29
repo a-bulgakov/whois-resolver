@@ -10,6 +10,7 @@ from whois_resolver import (
     extract_asn,
     extract_org,
     get_network_info,
+    lookup_whois,
 )
 
 
@@ -127,6 +128,26 @@ class TestExtractCidr(unittest.TestCase):
     def test_returns_none_on_empty(self):
         self.assertIsNone(extract_cidr(""))
 
+    def test_picks_most_specific_containing_ip(self):
+        # В ответе два route-объекта; для 8.8.8.8 нужен самый узкий, /24.
+        response = "route: 8.0.0.0/8\nroute: 8.8.8.0/24\n"
+        self.assertEqual(extract_cidr(response, "8.8.8.8"), "8.8.8.0/24")
+
+    def test_skips_cidr_not_containing_ip(self):
+        # Первый по тексту блок не содержит IP — должен быть выбран второй.
+        response = "route: 1.0.0.0/24\nroute: 8.8.8.0/24\n"
+        self.assertEqual(extract_cidr(response, "8.8.8.8"), "8.8.8.0/24")
+
+    def test_returns_none_when_no_cidr_contains_ip(self):
+        self.assertIsNone(extract_cidr("route: 1.0.0.0/24", "8.8.8.8"))
+
+    def test_route6_field(self):
+        self.assertEqual(extract_cidr("route6: 2001:db8::/32"), "2001:db8::/32")
+
+    def test_inet6num_range_converted(self):
+        response = "inet6num: 2001:db8:: - 2001:db8:0:ffff:ffff:ffff:ffff:ffff"
+        self.assertEqual(extract_cidr(response), "2001:db8::/48")
+
 
 class TestExtractAsn(unittest.TestCase):
     def test_origin_field(self):
@@ -138,8 +159,12 @@ class TestExtractAsn(unittest.TestCase):
     def test_asnumber_field(self):
         self.assertEqual(extract_asn("ASNumber: AS15169"), "AS15169")
 
-    def test_bare_as_with_space(self):
-        self.assertEqual(extract_asn("AS 15169"), "AS15169")
+    def test_bare_as_without_space(self):
+        self.assertEqual(extract_asn("see AS15169 for details"), "AS15169")
+
+    def test_ignores_short_false_positive(self):
+        # "AS 12" с пробелом и коротким числом не должно ловиться как ASN.
+        self.assertIsNone(extract_asn("the class AS 12 example"))
 
     def test_case_insensitive(self):
         self.assertEqual(extract_asn("ORIGIN: AS15169"), "AS15169")
@@ -207,6 +232,103 @@ class TestGetNetworkInfo(unittest.TestCase):
     def test_returns_none_on_invalid(self):
         self.assertIsNone(get_network_info("not-a-cidr"))
         self.assertIsNone(get_network_info(""))
+
+
+class TestLookupWhois(unittest.TestCase):
+    @patch("whois_resolver.whois_query")
+    def test_ip_input_full_result(self, mock_query):
+        mock_query.return_value = (
+            "route: 8.8.8.0/24\norigin: AS15169\norg-name: Google LLC\ncountry: US\n"
+        )
+        result = lookup_whois("8.8.8.8")
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["type"], "IP-адрес")
+        self.assertEqual(len(result["networks"]), 1)
+        net = result["networks"][0]
+        self.assertEqual(net["ip"], "8.8.8.8")
+        self.assertEqual(net["cidr"], "8.8.8.0/24")
+        self.assertEqual(net["asn"], "AS15169")
+        self.assertEqual(net["org"]["name"], "Google LLC")
+        self.assertEqual(net["org"]["country"], "US")
+        self.assertIsNotNone(net["network"])
+
+    @patch("whois_resolver.whois_query")
+    def test_stops_at_first_server_with_cidr(self, mock_query):
+        # Первый сервер без CIDR, второй — с CIDR: должен выбраться второй.
+        mock_query.side_effect = [
+            "no route here\n",
+            "route: 8.8.8.0/24\n",
+        ]
+        result = lookup_whois("8.8.8.8")
+        net = result["networks"][0]
+        self.assertEqual(net["cidr"], "8.8.8.0/24")
+        self.assertEqual(net["server"], "whois.ripe.net")
+        self.assertEqual(mock_query.call_count, 2)
+
+    @patch("whois_resolver.whois_query")
+    def test_falls_back_when_no_cidr_anywhere(self, mock_query):
+        # Ни один сервер не дал CIDR, но ASN извлекается из первого ответа.
+        mock_query.return_value = "origin: AS15169\n"
+        result = lookup_whois("8.8.8.8")
+        net = result["networks"][0]
+        self.assertIsNone(net["cidr"])
+        self.assertEqual(net["asn"], "AS15169")
+        self.assertEqual(net["server"], "whois.radb.net")
+
+    @patch("whois_resolver.whois_query", return_value=None)
+    def test_error_when_all_servers_fail(self, _):
+        result = lookup_whois("8.8.8.8")
+        self.assertIsNotNone(result["error"])
+        self.assertEqual(result["networks"], [])
+
+    def test_private_ip_error(self):
+        result = lookup_whois("192.168.1.1")
+        self.assertIn("приватный", result["error"])
+
+    def test_invalid_input_error(self):
+        result = lookup_whois("not a valid input!!!")
+        self.assertIsNotNone(result["error"])
+        self.assertEqual(result["networks"], [])
+
+    @patch("whois_resolver.whois_query")
+    @patch("whois_resolver.resolve_domain")
+    def test_domain_single_ip(self, mock_resolve, mock_query):
+        mock_resolve.return_value = {"all_ipv4": ["8.8.8.8"], "all_ipv6": []}
+        mock_query.return_value = "route: 8.8.8.0/24\n"
+        result = lookup_whois("dns.google")
+        self.assertEqual(result["type"], "домен")
+        self.assertEqual(result["all_ipv4"], ["8.8.8.8"])
+        self.assertEqual(len(result["networks"]), 1)
+        self.assertEqual(result["networks"][0]["cidr"], "8.8.8.0/24")
+
+    @patch("whois_resolver.whois_query")
+    @patch("whois_resolver.resolve_domain")
+    def test_domain_addresses_in_same_cidr_collapse(self, mock_resolve, mock_query):
+        # Два адреса из одной /24: должен быть один сетевой блок, второй адрес
+        # попадает в covered_ips, повторный WHOIS-запрос не делается.
+        mock_resolve.return_value = {"all_ipv4": ["8.8.8.8", "8.8.8.9"], "all_ipv6": []}
+        mock_query.return_value = "route: 8.8.8.0/24\n"
+        result = lookup_whois("dns.google")
+        self.assertEqual(len(result["networks"]), 1)
+        self.assertEqual(result["networks"][0]["covered_ips"], ["8.8.8.8", "8.8.8.9"])
+        # Запрос ушёл только для первого адреса (перебор серверов до CIDR = 1 вызов).
+        self.assertEqual(mock_query.call_count, 1)
+
+    @patch("whois_resolver.whois_query")
+    @patch("whois_resolver.resolve_domain")
+    def test_domain_addresses_in_different_cidrs(self, mock_resolve, mock_query):
+        # Два адреса из разных сетей: должно получиться два блока.
+        mock_resolve.return_value = {"all_ipv4": ["8.8.8.8", "1.1.1.1"], "all_ipv6": []}
+        mock_query.side_effect = ["route: 8.8.8.0/24\n", "route: 1.1.1.0/24\n"]
+        result = lookup_whois("example.com")
+        self.assertEqual(len(result["networks"]), 2)
+        cidrs = {n["cidr"] for n in result["networks"]}
+        self.assertEqual(cidrs, {"8.8.8.0/24", "1.1.1.0/24"})
+
+    @patch("whois_resolver.resolve_domain", return_value=None)
+    def test_domain_resolve_failure(self, _):
+        result = lookup_whois("nonexistent.invalid")
+        self.assertIn("разрешить", result["error"])
 
 
 if __name__ == "__main__":
